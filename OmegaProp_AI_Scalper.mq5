@@ -3,18 +3,28 @@
 #property version   "1.00"
 #property strict
 /*
- OmegaProp_AI_Scalper.mq5
+ OmegaProp_AI_Scalper.mq5 ("PropBurst" release)
  -------------------------------------------------
- High-frequency intraday scalper tuned for prop-firm style constraints.
- Attach to an M1 chart of any supported symbol (default XAUUSD). The EA internally
- manages both XAUUSD and EURUSD provided that the broker supports simultaneous
- trading from a single chart instance.
- 
- Setup Notes:
- - Configure risk parameters to respect prop limits (AccountRiskPerTradePercent,
-   MaxDailyLossPercent, MaxTotalLossPercent, TargetProfitPercent).
- - Allow WebRequest access to the configured AI_Server_URL if AI MetaBrain is used.
- - Test extensively on demo / evaluation accounts. There is no performance guarantee.
+ Fully-automated, high-frequency scalper tailored for prop-firm evaluations.
+ Attach to any M1 chart (recommended: XAUUSD). The EA manages both XAUUSD and
+ EURUSD internally using multi-symbol logic. Trend bias is derived from M5 data
+ while entries are executed on M1/ticks.
+
+ Recommended Use:
+ - Prop-firm challenge / verification phases with 25k accounts (1:100 leverage).
+ - Designed to respect hard loss limits (5% daily, 10% overall) and to stop
+   trading automatically once the configured profit target is reached.
+
+ Risk Warning:
+ - High-frequency scalping involves significant risk. There is NO guarantee of
+   passing prop evaluations. Always run on demo first and monitor broker rules.
+ - Although the prop firm does not require server-side stop losses, this EA
+   enforces virtual stops/targets plus prop-style risk halts.
+
+ Configuration Notes:
+ - Tune lot sizing and range/spread filters per broker.
+ - Update session/news blackout windows to match the prop desk schedule.
+ - Optional AI overrides are provided but disabled by default.
 */
 
 #include <Trade/Trade.mqh>
@@ -42,7 +52,7 @@ struct RangeInfo
 
 struct TickSpeedTracker
   {
-   double   ticks[];
+   long     ticks[];
    double   avg;
    datetime lastCleanup;
    long     lastTickMsc;
@@ -51,13 +61,15 @@ struct TickSpeedTracker
 struct TradeState
   {
    bool     hasPosition;
-   double   entryPrice;
-   double   stopLoss;
-   double   slDistance;
-   double   oneR;
+   bool     isBuy;
    bool     partialTaken;
-   datetime openTime;
-   double   atrAtEntry;
+   double   entryPrice;
+   double   virtualSL;
+   double   tp1Price;
+   double   tp2Price;
+   double   breakEvenPrice;
+   double   riskPips;
+   double   riskPercentUsed;
   };
 
 struct NewsInterval
@@ -83,21 +95,19 @@ input string Symbol_EUR                   = "EURUSD";
 input int    EMA_Fast_Period_M5           = 50;
 input int    EMA_Slow_Period_M5           = 200;
 
-input double VWAP_TolerancePips_XAU       = 30.0;
-input double VWAP_TolerancePips_EUR       = 2.5;
+input double VWAP_TolerancePips_XAU       = 40.0;
+input double VWAP_TolerancePips_EUR       = 20.0;
 
 input int    N_RangeBars                  = 6;
-input double MaxRangePips_XAU             = 35.0;
-input double MaxRangePips_EUR             = 4.0;
+input double MaxRangePips_XAU             = 50.0;
+input double MaxRangePips_EUR             = 10.0;
 
 input double BreakoutBufferPips_XAU       = 4.0;
 input double BreakoutBufferPips_EUR       = 0.5;
 input double MaxBreakoutBodyATR_Multiple  = 1.8;
 
-input int    ATR_Period_SL                = 14;
-input double SL_ATR_MinFactor             = 0.8;
-input double SL_ATR_MaxFactor             = 2.8;
-input double SL_Struct_Buffer_Pips        = 2.0;
+input int    ATR_Period_M1                = 14;
+input double SL_Buffer_Pips               = 2.0;
 input double MinSL_Pips_XAU               = 15.0;
 input double MaxSL_Pips_XAU               = 70.0;
 input double MinSL_Pips_EUR               = 4.0;
@@ -106,7 +116,7 @@ input double MaxSL_Pips_EUR               = 25.0;
 input double TP1_R_Multiple               = 2.0;
 input double TP2_R_Multiple               = 3.0;
 input double BE_Buffer_Pips               = 0.5;
-input int    MaxHoldSeconds               = 900;
+input int    MaxHoldSeconds               = 180;
 
 input double AccountRiskPerTradePercent   = 0.5;
 input double MaxDailyLossPercent          = 4.0;
@@ -115,9 +125,10 @@ input double EmergencySL_Percent          = 2.0;
 input int    MaxConsecutiveLossesPerDay   = 4;
 input int    MinMinutesBetweenTrades      = 2;
 input double TargetProfitPercent          = 9.0;
-input double MaxSpreadPips_XAU            = 35.0;
-input double MaxSpreadPips_EUR            = 2.0;
+input double MaxSpreadPips_XAU            = 40.0;
+input double MaxSpreadPips_EUR            = 3.0;
 input double MaxLotPerTrade               = 20.0;
+input double MaxSlippagePoints            = 30.0;
 
 input int    TickWindowSeconds            = 10;
 input double TickSpeedMultiplier          = 1.5;
@@ -138,6 +149,8 @@ input int    AI_UpdateIntervalMinutes     = 15;
 input bool   EnableDashboard              = true;
 input int    DashboardRefreshMillis       = 750;
 input bool   EnableDebugLogs              = true;
+input bool   LogToFile                    = false;
+input string LogFileName                  = "PropBurstLogs.csv";
 input ulong  MagicNumber                  = 25011984;
 
 //---------------------------------------------------------------------------
@@ -165,6 +178,7 @@ struct SymbolRuntime
    int            emaFastHandle;
    int            emaSlowHandle;
    int            atrHandle;
+   string         lastBlockReason;
   };
 
 SymbolRuntime runtimes[2];
@@ -200,10 +214,30 @@ string TrimString(string value)
    return(value);
   }
 
-void Log(string text)
+void AppendCsvLog(const string event,const string symbol,const string message)
   {
+   if(!LogToFile)
+      return;
+   int handle = FileOpen(LogFileName,FILE_READ|FILE_WRITE|FILE_CSV|FILE_SHARE_WRITE|FILE_ANSI);
+   if(handle==INVALID_HANDLE)
+      return;
+   FileSeek(handle,0,SEEK_END);
+   FileWrite(handle,TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS),event,symbol,message,
+             FormatDouble(DailyDrawdownPercent,2),FormatDouble(TotalDrawdownPercent,2));
+   FileClose(handle);
+  }
+
+void LogMessage(string text)
+  {
+   string stamp = TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS)+" | "+text;
    if(EnableDebugLogs)
-      Print(text);
+      Print(stamp);
+  }
+
+void LogTradeRecord(const string event,const string symbol,const string detail)
+  {
+   LogMessage("["+symbol+"] "+event+": "+detail);
+   AppendCsvLog(event,symbol,detail);
   }
 
 string ExtractJsonToken(const string json,const string key)
@@ -325,8 +359,17 @@ void ParseNewsIntervals()
       string range = StringSubstr(segment,delim+1);
       string times[];
       if(StringSplit(range,'-',times)!=2) continue;
-      datetime start = StringToTime(date+" "+times[0]);
-      datetime end   = StringToTime(date+" "+times[1]);
+      string normalizedDate = date;
+      StringReplace(normalizedDate,"-","");
+      if(StringLen(normalizedDate)==8 && StringFind(normalizedDate,".")==-1)
+        {
+         normalizedDate = StringSubstr(normalizedDate,0,4)+"."+
+                           StringSubstr(normalizedDate,4,2)+"."+
+                           StringSubstr(normalizedDate,6,2);
+        }
+      StringReplace(normalizedDate,"-",".");
+      datetime start = StringToTime(normalizedDate+" "+times[0]);
+      datetime end   = StringToTime(normalizedDate+" "+times[1]);
       if(end<=start) continue;
       NewsInterval ni;
       ni.start = start;
@@ -378,13 +421,23 @@ void InitSymbolRuntime(SymbolRuntime &rt,const SymbolSettings &settings)
    rt.tickTracker.lastCleanup = TimeCurrent();
    rt.tickTracker.lastTickMsc = 0;
    rt.tradeState.hasPosition = false;
+   rt.tradeState.partialTaken = false;
+   rt.tradeState.isBuy = true;
+   rt.tradeState.entryPrice = 0.0;
+   rt.tradeState.virtualSL = 0.0;
+   rt.tradeState.tp1Price = 0.0;
+   rt.tradeState.tp2Price = 0.0;
+   rt.tradeState.breakEvenPrice = 0.0;
+   rt.tradeState.riskPips = 0.0;
+   rt.tradeState.riskPercentUsed = 0.0;
    rt.lastTradeTime = 0;
    rt.bias = BIAS_NEUTRAL;
+   rt.lastBlockReason = "";
    rt.emaFastHandle = iMA(rt.settings.symbol,PERIOD_M5,EMA_Fast_Period_M5,0,MODE_EMA,PRICE_CLOSE);
    rt.emaSlowHandle = iMA(rt.settings.symbol,PERIOD_M5,EMA_Slow_Period_M5,0,MODE_EMA,PRICE_CLOSE);
-   rt.atrHandle = iATR(rt.settings.symbol,PERIOD_M1,ATR_Period_SL);
+   rt.atrHandle = iATR(rt.settings.symbol,PERIOD_M1,ATR_Period_M1);
    if(rt.emaFastHandle==INVALID_HANDLE || rt.emaSlowHandle==INVALID_HANDLE || rt.atrHandle==INVALID_HANDLE)
-      Log("Indicator handle creation failed for "+rt.settings.symbol);
+      LogMessage("Indicator handle creation failed for "+rt.settings.symbol);
   }
 
 SymbolRuntime* GetRuntime(int index)
@@ -538,51 +591,21 @@ double GetATR(SymbolRuntime &rt)
   }
 
 //---------------------------------------------------------------------------
-bool GetSwingLevels(string symbol,double &swingHigh,double &swingLow)
+bool ComputeSmartSL(SymbolRuntime &rt,double entryPrice,bool isBuy,double &sl,double &slPips)
   {
-   MqlRates rates[];
-   if(CopyRates(symbol,PERIOD_M1,1,10,rates)<5)
+   if(!rt.range.valid)
       return(false);
-   swingHigh = rates[0].high;
-   swingLow  = rates[0].low;
-   for(int i=1;i<10;i++)
-     {
-      swingHigh = MathMax(swingHigh,rates[i].high);
-      swingLow  = MathMin(swingLow,rates[i].low);
-     }
-   return(true);
-  }
-
-//---------------------------------------------------------------------------
-bool ComputeSmartSL(SymbolRuntime &rt,double entryPrice,bool isBuy,double &sl,double &slPips,double atr)
-  {
-   double swingHigh,swingLow;
-   if(!GetSwingLevels(rt.settings.symbol,swingHigh,swingLow))
-      return(false);
-   double slBase;
    double point = SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT);
-   if(isBuy)
-     {
-      slBase = MathMin(rt.range.low,MathMin(swingLow,entryPrice)) - SL_Struct_Buffer_Pips*point;
-     }
-   else
-     {
-      slBase = MathMax(rt.range.high,MathMax(swingHigh,entryPrice)) + SL_Struct_Buffer_Pips*point;
-     }
-   double slDist = MathAbs(entryPrice-slBase);
-   double minDist = SL_ATR_MinFactor*atr;
-   double maxDist = SL_ATR_MaxFactor*atr;
-   if(slDist<minDist)
-      slDist = minDist;
-   if(slDist>maxDist)
-      return(false);
+   double base = isBuy ? rt.range.low : rt.range.high;
+   double slCandidate = isBuy ? base - SL_Buffer_Pips*point : base + SL_Buffer_Pips*point;
+   double slDist = MathAbs(entryPrice-slCandidate);
    double slPipsRaw = slDist/point;
    double minSL = rt.settings.minSLPips;
    double maxSL = rt.settings.maxSLPips;
    if(slPipsRaw<minSL)
      {
-      slDist = minSL*point;
       slPipsRaw = minSL;
+      slDist = slPipsRaw*point;
      }
    if(slPipsRaw>maxSL)
       return(false);
@@ -608,13 +631,33 @@ double CalculateLotSize(const string symbol,double slPips,double riskPercent)
    double pipValue = tickValue * point/tickSize;
    if(pipValue==0)
       pipValue = tickValue;
-   double lot = riskAmount/(slPips*pipValue);
+   double proposedLot = riskAmount/(slPips*pipValue);
    double minLot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN);
    double maxLot = MathMin(SymbolInfoDouble(symbol,SYMBOL_VOLUME_MAX),MaxLotPerTrade);
    double step = SymbolInfoDouble(symbol,SYMBOL_VOLUME_STEP);
-   lot = MathMax(minLot,MathMin(maxLot,lot));
+   if(proposedLot<minLot)
+      return(0.0);
+   double lot = MathMin(maxLot,proposedLot);
    lot = MathFloor(lot/step)*step;
-   return(NormalizeDouble(lot,(int)SymbolInfoInteger(symbol,SYMBOL_VOLUME_DIGITS)));
+   lot = NormalizeDouble(lot,(int)SymbolInfoInteger(symbol,SYMBOL_VOLUME_DIGITS));
+   if(lot<minLot)
+      return(0.0);
+   return(lot);
+  }
+
+double NormalizeVolume(const string symbol,double volume)
+  {
+   if(volume<=0)
+      return(0.0);
+   double step = SymbolInfoDouble(symbol,SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN);
+   if(step<=0)
+      step = 0.01;
+   double normalized = MathFloor(volume/step+0.0000001)*step;
+   normalized = NormalizeDouble(normalized,(int)SymbolInfoInteger(symbol,SYMBOL_VOLUME_DIGITS));
+   if(normalized<minLot)
+      return(0.0);
+   return(normalized);
   }
 
 //---------------------------------------------------------------------------
@@ -735,11 +778,43 @@ bool EmergencyStopCheck(SymbolRuntime &rt)
    double threshold = AccountInfoDouble(ACCOUNT_BALANCE)*EmergencySL_Percent/100.0;
    if(lossMoney>=threshold)
      {
-      Log("Emergency SL triggered for "+rt.settings.symbol);
+      LogTradeRecord("EMERGENCY",rt.settings.symbol,"Emergency SL triggered. Loss="+FormatDouble(lossMoney,2));
       trade.PositionClose(rt.settings.symbol);
       return(true);
      }
    return(false);
+  }
+
+//---------------------------------------------------------------------------
+void EnsureTradeStateFromPosition(SymbolRuntime &rt)
+  {
+   if(!PositionSelect(rt.settings.symbol))
+     {
+      rt.tradeState.hasPosition=false;
+      return;
+     }
+   if(rt.tradeState.hasPosition)
+      return;
+   rt.tradeState.hasPosition=true;
+   rt.tradeState.entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   rt.tradeState.isBuy = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+   double point = SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT);
+   double slServer = PositionGetDouble(POSITION_SL);
+   double inferredRisk = 0.0;
+   if(slServer>0)
+      inferredRisk = MathAbs(rt.tradeState.entryPrice-slServer)/point;
+   if(inferredRisk<=0)
+      inferredRisk = MathMax(rt.settings.minSLPips,rt.tradeState.riskPips);
+   if(inferredRisk<=0)
+      inferredRisk = rt.settings.minSLPips;
+   rt.tradeState.riskPips = inferredRisk;
+   double distance = inferredRisk*point;
+   rt.tradeState.virtualSL = rt.tradeState.isBuy ? rt.tradeState.entryPrice - distance : rt.tradeState.entryPrice + distance;
+   rt.tradeState.tp1Price  = rt.tradeState.isBuy ? rt.tradeState.entryPrice + distance*TP1_R_Multiple : rt.tradeState.entryPrice - distance*TP1_R_Multiple;
+   rt.tradeState.tp2Price  = rt.tradeState.isBuy ? rt.tradeState.entryPrice + distance*TP2_R_Multiple : rt.tradeState.entryPrice - distance*TP2_R_Multiple;
+   rt.tradeState.breakEvenPrice = rt.tradeState.isBuy ? rt.tradeState.entryPrice + BE_Buffer_Pips*point : rt.tradeState.entryPrice - BE_Buffer_Pips*point;
+   rt.tradeState.partialTaken = false;
+   rt.tradeState.riskPercentUsed = AccountRiskPerTradePercent;
   }
 
 //---------------------------------------------------------------------------
@@ -750,56 +825,75 @@ void ManageOpenTrade(SymbolRuntime &rt)
       rt.tradeState.hasPosition=false;
       return;
      }
+   EnsureTradeStateFromPosition(rt);
    rt.tradeState.hasPosition=true;
    double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    MqlTick tick;
    SymbolInfoTick(rt.settings.symbol,tick);
    long positionType = PositionGetInteger(POSITION_TYPE);
    double currentPrice = (positionType==POSITION_TYPE_BUY)?tick.bid:tick.ask;
-   double sl = PositionGetDouble(POSITION_SL);
-   double tp = PositionGetDouble(POSITION_TP);
-   double slDistance = MathAbs(entryPrice-sl);
-   double oneR = slDistance;
    double volume = PositionGetDouble(POSITION_VOLUME);
    bool isBuy = positionType==POSITION_TYPE_BUY;
-   // partial close at +1R
-   double target = isBuy?(entryPrice+oneR):(entryPrice-oneR);
+   trade.SetExpertMagicNumber(MagicNumber);
+   // virtual SL check
+   if( (isBuy && currentPrice<=rt.tradeState.virtualSL) || (!isBuy && currentPrice>=rt.tradeState.virtualSL) )
+     {
+      if(trade.PositionClose(rt.settings.symbol))
+         LogTradeRecord("EXIT_SL",rt.settings.symbol,
+                        "Virtual SL hit | risk% "+FormatDouble(rt.tradeState.riskPercentUsed,2));
+      else
+         LogTradeRecord("EXIT_FAIL",rt.settings.symbol,
+                        "Virtual SL close failed retcode "+IntegerToString(trade.ResultRetcode()));
+      rt.tradeState.hasPosition=false;
+      return;
+     }
+   // TP1 handling
    if(!rt.tradeState.partialTaken)
      {
-      if( (isBuy && currentPrice>=target) || (!isBuy && currentPrice<=target) )
+      bool tp1Hit = (isBuy && currentPrice>=rt.tradeState.tp1Price) || (!isBuy && currentPrice<=rt.tradeState.tp1Price);
+      if(tp1Hit)
         {
-         double closeVolume = volume*0.5;
-         double minVol = SymbolInfoDouble(rt.settings.symbol,SYMBOL_VOLUME_MIN);
-         double step = SymbolInfoDouble(rt.settings.symbol,SYMBOL_VOLUME_STEP);
-         closeVolume = MathMax(minVol,MathFloor(closeVolume/step)*step);
-         closeVolume = MathMin(volume-minVol,closeVolume);
-         if(closeVolume>0 && closeVolume>=minVol)
-            trade.PositionClosePartial(rt.settings.symbol,closeVolume);
-         double newSL = isBuy ? entryPrice + BE_Buffer_Pips*SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT) : entryPrice - BE_Buffer_Pips*SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT);
-         trade.PositionModify(rt.settings.symbol,newSL,tp);
+         double desiredClose = volume*0.5;
+         double minLot = SymbolInfoDouble(rt.settings.symbol,SYMBOL_VOLUME_MIN);
+         double closeVolume = NormalizeVolume(rt.settings.symbol,desiredClose);
+         if(closeVolume<=0 || volume-closeVolume<minLot)
+            closeVolume = NormalizeVolume(rt.settings.symbol,volume-minLot);
+         if(closeVolume>0 && closeVolume<volume)
+           {
+            if(trade.PositionClosePartial(rt.settings.symbol,closeVolume))
+               LogTradeRecord("TP1",rt.settings.symbol,
+                              "Closed "+FormatDouble(closeVolume,2)+" lots at R="+FormatDouble(TP1_R_Multiple,1)+
+                              " | risk% "+FormatDouble(rt.tradeState.riskPercentUsed,2));
+            else
+               LogTradeRecord("TP1_FAIL",rt.settings.symbol,"Partial close retcode "+IntegerToString(trade.ResultRetcode()));
+           }
+         rt.tradeState.virtualSL = rt.tradeState.breakEvenPrice;
          rt.tradeState.partialTaken = true;
         }
      }
-   // time-based management
-   if(MaxHoldSeconds>0 && TimeCurrent()-PositionGetInteger(POSITION_TIME) > MaxHoldSeconds)
+   // TP2 handling (exit remainder)
+   bool tp2Hit = (isBuy && currentPrice>=rt.tradeState.tp2Price) || (!isBuy && currentPrice<=rt.tradeState.tp2Price);
+   if(tp2Hit)
      {
-      double lockPrice = isBuy ? entryPrice + 0.3*oneR : entryPrice - 0.3*oneR;
-      trade.PositionModify(rt.settings.symbol,lockPrice,tp);
+      if(trade.PositionClose(rt.settings.symbol))
+         LogTradeRecord("TP2",rt.settings.symbol,
+                        "Final target hit | risk% "+FormatDouble(rt.tradeState.riskPercentUsed,2));
+      else
+         LogTradeRecord("EXIT_FAIL",rt.settings.symbol,"TP2 close failed retcode "+IntegerToString(trade.ResultRetcode()));
+      rt.tradeState.hasPosition=false;
+      return;
      }
-   // trailing logic using fractals approximated by ATR
-   double atr = GetATR(rt);
-   double trailBuffer = 0.5*atr;
-   if(isBuy)
+   // time stop
+   datetime posTime = (datetime)PositionGetInteger(POSITION_TIME);
+   if(MaxHoldSeconds>0 && TimeCurrent()-posTime >= MaxHoldSeconds)
      {
-      double newSL = currentPrice - trailBuffer;
-      if(newSL>sl)
-         trade.PositionModify(rt.settings.symbol,newSL,tp);
-     }
-   else
-     {
-      double newSL = currentPrice + trailBuffer;
-      if(newSL<sl)
-         trade.PositionModify(rt.settings.symbol,newSL,tp);
+      if(trade.PositionClose(rt.settings.symbol))
+         LogTradeRecord("TIME_EXIT",rt.settings.symbol,
+                        "Max hold exceeded | risk% "+FormatDouble(rt.tradeState.riskPercentUsed,2));
+      else
+         LogTradeRecord("EXIT_FAIL",rt.settings.symbol,"Time exit failed retcode "+IntegerToString(trade.ResultRetcode()));
+      rt.tradeState.hasPosition=false;
+      return;
      }
    EmergencyStopCheck(rt);
   }
@@ -844,7 +938,7 @@ bool OpenTrade(SymbolRuntime &rt,bool isBuy)
    if(!EvaluateBreakout(rt,isBuy,atr,entryPrice))
       return(false);
    double slPrice,slPips;
-   if(!ComputeSmartSL(rt,entryPrice,isBuy,slPrice,slPips,atr))
+   if(!ComputeSmartSL(rt,entryPrice,isBuy,slPrice,slPips))
       return(false);
    double riskPercent = AccountRiskPerTradePercent;
    if(aiState.riskMultiplier>0)
@@ -854,30 +948,45 @@ bool OpenTrade(SymbolRuntime &rt,bool isBuy)
    double lot = CalculateLotSize(rt.settings.symbol,slPips,riskPercent);
    if(lot<=0)
       return(false);
-   double tp1 = isBuy ? entryPrice + slPips*SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT)*TP1_R_Multiple : entryPrice - slPips*SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT)*TP1_R_Multiple;
-   double tp2 = isBuy ? entryPrice + slPips*SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT)*TP2_R_Multiple : entryPrice - slPips*SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT)*TP2_R_Multiple;
-   double tp = tp2;
+   double point = SymbolInfoDouble(rt.settings.symbol,SYMBOL_POINT);
+   double riskDistance = slPips*point;
    trade.SetExpertMagicNumber(MagicNumber);
-   bool result = isBuy ? trade.Buy(lot,rt.settings.symbol,0.0,slPrice,tp,"OmegaBuy") : trade.Sell(lot,rt.settings.symbol,0.0,slPrice,tp,"OmegaSell");
+   trade.SetDeviationInPoints((int)MaxSlippagePoints);
+   bool result = isBuy ? trade.Buy(lot,rt.settings.symbol,0.0,0.0,0.0,"PropBurstBuy") : trade.Sell(lot,rt.settings.symbol,0.0,0.0,0.0,"PropBurstSell");
    if(result)
      {
       if(PositionSelect(rt.settings.symbol))
          entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double actualRiskDist = riskDistance;
+      if(slPrice>0)
+         actualRiskDist = MathAbs(entryPrice - slPrice);
+      double tp1Price = isBuy ? entryPrice + actualRiskDist*TP1_R_Multiple : entryPrice - actualRiskDist*TP1_R_Multiple;
+      double tp2Price = isBuy ? entryPrice + actualRiskDist*TP2_R_Multiple : entryPrice - actualRiskDist*TP2_R_Multiple;
+      double virtualSL = isBuy ? entryPrice - actualRiskDist : entryPrice + actualRiskDist;
       rt.tradeState.hasPosition=true;
       rt.tradeState.entryPrice=entryPrice;
-      rt.tradeState.stopLoss=slPrice;
-      rt.tradeState.slDistance=MathAbs(entryPrice-slPrice);
-      rt.tradeState.oneR=MathAbs(entryPrice-slPrice);
+      rt.tradeState.virtualSL=virtualSL;
+      rt.tradeState.tp1Price=tp1Price;
+      rt.tradeState.tp2Price=tp2Price;
+      rt.tradeState.breakEvenPrice = isBuy ? entryPrice + BE_Buffer_Pips*point : entryPrice - BE_Buffer_Pips*point;
       rt.tradeState.partialTaken=false;
-      rt.tradeState.openTime=TimeCurrent();
-      rt.tradeState.atrAtEntry=atr;
+      rt.tradeState.riskPips=slPips;
+      rt.tradeState.isBuy=isBuy;
+      rt.tradeState.riskPercentUsed=riskPercent;
       rt.lastTradeTime = TimeCurrent();
       lastGlobalTradeTime = TimeCurrent();
       TradesToday++;
+      int priceDigits = (int)SymbolInfoInteger(rt.settings.symbol,SYMBOL_DIGITS);
+      string detail = StringFormat("Entry %s lots %s @ %s | SL %s | TP1 %s | TP2 %s | Risk%% %.2f | DailyDD %.2f | TotalDD %.2f",
+                                   DoubleToString(lot,2),(isBuy?"BUY":"SELL"),DoubleToString(entryPrice,priceDigits),
+                                   DoubleToString(virtualSL,priceDigits),DoubleToString(tp1Price,priceDigits),
+                                   DoubleToString(tp2Price,priceDigits),riskPercent,DailyDrawdownPercent,TotalDrawdownPercent);
+      LogTradeRecord("ENTRY",rt.settings.symbol,detail);
      }
    else
      {
-      Log("Trade failed: "+rt.settings.symbol+" error: "+IntegerToString(trade.ResultRetcode()));
+      LogTradeRecord("ORDER_FAIL",rt.settings.symbol,
+                     "OrderSend error: "+IntegerToString(trade.ResultRetcode()));
      }
    return(result);
   }
@@ -887,32 +996,49 @@ void CheckEntries(SymbolRuntime &rt)
   {
    if(!rt.settings.enabled)
       return;
+   string reason = "";
    if(!CheckRiskLimits())
-      return;
-   if(!TimeSinceLastTradeOK(rt))
-      return;
-   if(!GlobalCooldownOK())
-      return;
-   if(PositionSelect(rt.settings.symbol))
-      return;
-   if(!SpreadOK(rt))
-      return;
-   if(!DetectMicroRange(rt))
-      return;
-   if(!UpdateBias(rt))
-      return;
-   if(rt.bias==BIAS_NEUTRAL)
-      return;
-   double vwap;
-   bool priceOK;
-   if(!CalcVWAPCondition(rt,vwap,priceOK))
-      return;
-   if(!priceOK)
-      return;
-   if(!TickSpeedOK(rt))
-      return;
-   bool isBuy = (rt.bias==BIAS_LONG);
-   OpenTrade(rt,isBuy);
+      reason = "Risk:"+TradingHaltReason;
+   else if(!TimeSinceLastTradeOK(rt))
+      reason = "SymbolCooldown";
+   else if(!GlobalCooldownOK())
+      reason = "GlobalCooldown";
+   else if(PositionSelect(rt.settings.symbol))
+      reason = "PositionOpen";
+   else if(!SpreadOK(rt))
+      reason = "Spread";
+   else if(!DetectMicroRange(rt))
+      reason = "RangeInvalid";
+   else if(!UpdateBias(rt))
+      reason = "BiasCalc";
+   else if(rt.bias==BIAS_NEUTRAL)
+      reason = "NeutralBias";
+   else
+     {
+      double vwap;
+      bool priceOK;
+      if(!CalcVWAPCondition(rt,vwap,priceOK))
+         reason = "VWAPCalc";
+      else if(!priceOK)
+         reason = "VWAPGate";
+      else if(!TickSpeedOK(rt))
+         reason = "TickSpeed";
+      else
+        {
+         bool isBuy = (rt.bias==BIAS_LONG);
+         if(OpenTrade(rt,isBuy))
+           {
+            rt.lastBlockReason = "";
+            return;
+           }
+         reason = "OrderRejected";
+        }
+     }
+   if(reason!="" && reason!=rt.lastBlockReason)
+     {
+      LogTradeRecord("SKIP",rt.settings.symbol,reason);
+      rt.lastBlockReason = reason;
+     }
   }
 
 //---------------------------------------------------------------------------
